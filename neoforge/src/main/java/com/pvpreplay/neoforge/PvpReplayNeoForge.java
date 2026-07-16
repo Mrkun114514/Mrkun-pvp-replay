@@ -11,6 +11,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppedEvent;
@@ -65,7 +66,7 @@ public class PvpReplayNeoForge {
         log.info("PvpReplay 已加载。模式=" + config.getMode() + " 视角=" + config.getPerspective()
                 + " 上限=" + config.getMaxDiskGb() + "GB/" + config.getMaxDays() + "天");
 
-        net.neoforged.neoforge.NeoForge.EVENT_BUS.register(this);
+        NeoForge.EVENT_BUS.register(this);
     }
 
     @SubscribeEvent
