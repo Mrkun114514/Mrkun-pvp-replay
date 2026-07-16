@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "pvp-replay",
+  "version": "1.0.0",
+  "name": "PvpReplay",
+  "description": "为 PvP 提供轻量化服务端回放（天坑/职业战争 与 1v1 两种模式，低内存占用）。",
+  "authors": ["WorkBuddy"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "server",
+  "entrypoints": {
+    "main": ["com.pvpreplay.fabric.PvpReplayFabric"]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": ["1.20.x", "1.21.x"],
+    "java": ">=21"
+  },
+  "mixins": []
+}

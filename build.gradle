@@ -1,0 +1,5 @@
+// Root project: only sets group/version. Each subproject applies its own plugins.
+allprojects {
+    group = project.findProperty('group') ?: 'com.pvpreplay'
+    version = project.findProperty('version') ?: '1.0.0'
+}

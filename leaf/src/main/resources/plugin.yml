@@ -1,0 +1,6 @@
+name: PvpReplay
+version: 1.0.0
+main: com.pvpreplay.leaf.PvpReplayLeaf
+api-version: "1.21"
+author: WorkBuddy
+description: 轻量级 PvP 服务端回放（天坑/职业战争 与 1v1 两种模式，低内存占用）。

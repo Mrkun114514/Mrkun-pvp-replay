@@ -1,0 +1,26 @@
+modLoader="javafml"
+loaderVersion="[1,)"
+license="MIT"
+showAsResourcePack=false
+
+[[mods]]
+modId="pvp_replay"
+version="1.0.0"
+displayName="PvpReplay"
+description="为 PvP 提供轻量化服务端回放（天坑/职业战争 与 1v1 两种模式，低内存占用）。"
+authors="WorkBuddy"
+logoFile=""
+
+[[dependencies.pvp_replay]]
+modId="neoforge"
+type="required"
+versionRange="[20.4,)"
+ordering="NONE"
+side="SERVER"
+
+[[dependencies.pvp_replay]]
+modId="minecraft"
+type="required"
+versionRange="[1.20,)"
+ordering="NONE"
+side="SERVER"

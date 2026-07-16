@@ -1,0 +1,21 @@
+plugins {
+    id 'net.neoforged.moddev' version '1.0.+'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(':common')
+    implementation project(':capture')
+
+    // 源码直接引用 io.netty.channel.*，编译期需要 netty（运行期由游戏提供）
+    compileOnly 'io.netty:netty-transport:4.1.97.Final'
+    compileOnly 'io.netty:netty-buffer:4.1.97.Final'
+}
+
+neoForge {
+    version = project.neoforge_version
+    // 若需要 access transformer / mixin，可在此追加配置
+}

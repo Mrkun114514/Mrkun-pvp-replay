@@ -1,0 +1,22 @@
+# Build output
+build/
+out/
+bin/
+.gradle/
+**/.gradle/
+
+# Local replays / runtime data
+replays/
+config/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local agent memory (project-specific, not for repo)
+.workbuddy/

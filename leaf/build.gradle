@@ -1,0 +1,26 @@
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://repo.papermc.io/repository/maven-public/' }
+}
+
+dependencies {
+    // 仅编译期依赖 paper-api；NMS 通过反射访问，无需 paperweight。
+    compileOnly 'io.papermc.paper:paper-api:' + project.paper_version
+
+    implementation project(':common')
+    implementation project(':capture')
+
+    // 源码直接引用 io.netty.channel.*，编译期需要 netty（运行期由服务端提供）
+    compileOnly 'io.netty:netty-transport:4.1.97.Final'
+    compileOnly 'io.netty:netty-buffer:4.1.97.Final'
+}
+
+// 产出可被 LEAF / Paper / Folia 直接加载的插件 jar
+tasks.named('jar') {
+    archiveBaseName.set('PvpReplay')
+    archiveVersion.set(project.version)
+}

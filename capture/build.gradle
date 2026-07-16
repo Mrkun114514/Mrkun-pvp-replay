@@ -1,0 +1,15 @@
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(':common')
+    // Netty 仅在编译期需要（运行期由游戏自身提供）。
+    // MC 1.20–1.21 使用 Netty 4.1.x，版本号不影响 API 兼容性。
+    compileOnly 'io.netty:netty-transport:4.1.97.Final'
+    compileOnly 'io.netty:netty-buffer:4.1.97.Final'
+}

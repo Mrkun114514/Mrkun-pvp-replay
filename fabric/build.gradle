@@ -1,0 +1,21 @@
+plugins {
+    id 'fabric-loom' version '1.10.+'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    implementation project(':common')
+    implementation project(':capture')
+
+    // 源码直接引用 io.netty.channel.*，编译期需要 netty（运行期由游戏提供）
+    compileOnly 'io.netty:netty-transport:4.1.97.Final'
+    compileOnly 'io.netty:netty-buffer:4.1.97.Final'
+}
