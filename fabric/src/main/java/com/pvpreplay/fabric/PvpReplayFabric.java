@@ -13,7 +13,7 @@ import net.fabricmc.fabric.api.networking.v1.ServerLoginConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.network.ServerLoginPacketListenerImpl;
+import net.minecraft.server.network.ServerLoginNetworkHandler;
 import net.minecraft.server.network.ServerPlayNetworkHandler;
 import net.minecraft.server.network.ServerPlayerEntity;
 import io.netty.channel.Channel;
@@ -91,7 +91,7 @@ public class PvpReplayFabric implements ModInitializer {
     // C0: inject the capture handler at login success (same channel as the play
     // phase). The handler buffers outbound packets until onJoin() calls beginSession.
     // The channel is fetched reflectively (loginHandler.connection -> channel()).
-    private void onLogin(ServerLoginPacketListenerImpl loginHandler) {
+    private void onLogin(ServerLoginNetworkHandler loginHandler) {
         if (!mgr.isRecording()) return;
         Object conn = tryField(loginHandler, "connection"); // ClientConnection (Yarn)
         if (conn == null) conn = tryInvoke(loginHandler, "getConnection");
