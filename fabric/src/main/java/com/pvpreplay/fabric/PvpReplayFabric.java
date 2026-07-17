@@ -71,9 +71,10 @@ public class PvpReplayFabric implements ModInitializer {
         log.info("PvpReplay 已加载。模式=" + config.getMode() + " 视角=" + config.getPerspective()
                 + " 上限=" + config.getMaxDiskGb() + "GB/" + config.getMaxDays() + "天");
 
-        // C0: inject the capture handler as early as login success, so the Login /
-        // Respawn / initial-chunk packets are buffered before the play session starts.
-        ServerLoginConnectionEvents.LOGIN_SUCCESS.register((loginHandler, server) -> onLogin(loginHandler));
+        // C0: inject the capture handler as early as the LOGIN state (ServerLoginConnectionEvents.INIT),
+        // so the Login / Respawn / initial-chunk packets are buffered before the play session starts.
+        // (Fabric API 0.102 has INIT, not LOGIN_SUCCESS.)
+        ServerLoginConnectionEvents.INIT.register((loginHandler, server) -> onLogin(loginHandler));
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> onJoin(handler));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> onLeave(handler));
         ServerTickEvents.END_SERVER_TICK.register(server -> pollDimensions(server));
