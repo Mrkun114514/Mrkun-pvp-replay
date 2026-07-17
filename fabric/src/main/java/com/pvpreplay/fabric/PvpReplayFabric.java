@@ -128,7 +128,7 @@ public class PvpReplayFabric implements ModInitializer {
     // player's current world differs from the last observed one (M3).
     private void pollDimensions(MinecraftServer server) {
         if (!mgr.isRecording()) return;
-        for (ServerPlayerEntity player : server.getPlayerList().getPlayers()) {
+        for (ServerPlayerEntity player : onlinePlayers(server)) {
             String uuid = playerUuid(player);
             if (uuid.isEmpty()) continue;
             String curDim = dimKey(player);
@@ -153,6 +153,23 @@ public class PvpReplayFabric implements ModInitializer {
         if (!each) cameraKeyByUuid.put(uuid, newKey);
         mgr.startSession(newKey, meta);
         PacketCapture.inject(channelOfPlayer(player), newKey, mgr, log);
+    }
+
+    // Fabric (Yarn) exposes the online players via MinecraftServer#getPlayerManager().getPlayerList();
+    // Mojang mappings use getPlayerList().getPlayers(). Reflect to stay mapping-agnostic.
+    @SuppressWarnings("unchecked")
+    private static java.util.List<ServerPlayerEntity> onlinePlayers(MinecraftServer server) {
+        try {
+            Object pm = tryInvoke(server, "getPlayerManager");   // Yarn
+            if (pm == null) pm = tryInvoke(server, "getPlayerList"); // Mojang
+            if (pm == null) return java.util.Collections.emptyList();
+            Object list = tryInvoke(pm, "getPlayerList");        // PlayerManager / PlayerList
+            if (list == null) list = tryInvoke(pm, "getPlayers");
+            if (list instanceof java.util.List) {
+                return (java.util.List<ServerPlayerEntity>) list;
+            }
+        } catch (Exception ignored) {}
+        return java.util.Collections.emptyList();
     }
 
     private boolean shouldRecord(String dim) {
