@@ -13,6 +13,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerLoginEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -72,29 +73,45 @@ public class PvpReplayLeaf extends JavaPlugin implements Listener {
         if (mgr != null) mgr.closeAll();
     }
 
+    // C0: inject the capture handler at login (same channel as play). Buffers
+    // outbound packets until onJoin() calls beginSession.
+    @EventHandler
+    public void onLogin(PlayerLoginEvent e) {
+        if (!mgr.isRecording()) return;
+        Channel ch = channelOf(e.getPlayer());
+        if (ch == null) return;
+        PacketCapture.inject(ch, mgr, log);
+    }
+
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
         Player player = e.getPlayer();
         if (!mgr.isRecording()) return;
+        Channel ch = channelOf(player);
         String dim = dimKey(player);
-        if (!shouldRecord(dim)) return;
+        if (!shouldRecord(dim)) {
+            PacketCapture.discard(ch); // DUEL 非目标维度：丢弃 login 缓冲，不录制
+            return;
+        }
 
         ReplayMeta meta = buildMeta(player);
         final String key;
         if (config.getPerspective() == ReplayConfig.Perspective.EACH) {
             key = "p_" + player.getUniqueId().toString();
-            mgr.startSession(key, meta);
         } else {
             String cameraUuid = player.getUniqueId().toString();
             key = "dim_" + sanitize(dim);
             if (cameraKeyByUuid.putIfAbsent(cameraUuid, key) != null) {
-                return; // 该维度已有镜头（或本玩家已是镜头）-> 非镜头：不注入、不结束
+                PacketCapture.discard(ch); // 非镜头 SHARED：停止缓冲、不录制
+                return;
             }
-            mgr.startSession(key, meta);
         }
 
-        Channel ch = channelOf(player);
-        PacketCapture.inject(ch, key, mgr, log);
+        // Anchor the session timeline to the connection moment (captured at login),
+        // then flush the buffered login-phase packets and switch to live capture.
+        long t0 = PacketCapture.getConnectionStartNanos(ch);
+        mgr.startSession(key, meta, t0 >= 0 ? t0 : System.nanoTime());
+        PacketCapture.beginSession(ch, key, mgr, log);
     }
 
     @EventHandler
@@ -107,7 +124,11 @@ public class PvpReplayLeaf extends JavaPlugin implements Listener {
             mgr.endSession(key);
         } else {
             String key = cameraKeyByUuid.remove(cameraUuid);
-            if (key == null) return; // 非镜头离开 -> 什么都不做
+            if (key == null) {
+                // C0: 非镜头 SHARED 玩家也在 login 阶段注入了缓冲，离开时清理以免泄漏
+                PacketCapture.remove(channelOf(player));
+                return;
+            }
             PacketCapture.remove(channelOf(player));
             mgr.endSession(key);
         }
@@ -126,15 +147,21 @@ public class PvpReplayLeaf extends JavaPlugin implements Listener {
         boolean each = config.getPerspective() == ReplayConfig.Perspective.EACH;
         String oldKey = each ? "p_" + uuid : cameraKeyByUuid.get(uuid);
         if (oldKey == null) return; // SHARED：非镜头玩家
-        PacketCapture.remove(channelOf(player));
+        Channel ch = channelOf(player);
+        PacketCapture.remove(ch);
         mgr.endSession(oldKey);
         if (!each) cameraKeyByUuid.remove(uuid);
         if (!shouldRecord(newDim)) return;
         ReplayMeta meta = buildMeta(player);
         String newKey = each ? "p_" + uuid : "dim_" + sanitize(newDim);
         if (!each) cameraKeyByUuid.put(uuid, newKey);
-        mgr.startSession(newKey, meta);
-        PacketCapture.inject(channelOf(player), newKey, mgr, log);
+        // 维度切换产生独立的 .mcpr，时间轴从切换时刻起算（而非连接时刻）。
+        long t0 = System.nanoTime();
+        mgr.startSession(newKey, meta, t0);
+        if (ch != null) {
+            PacketCapture.inject(ch, mgr, log);
+            PacketCapture.beginSession(ch, newKey, mgr, log);
+        }
     }
 
     private boolean shouldRecord(String dim) {

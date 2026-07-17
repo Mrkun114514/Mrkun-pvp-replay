@@ -9,9 +9,11 @@ import com.pvpreplay.core.ReplayMeta;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerLoginConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerLoginPacketListenerImpl;
 import net.minecraft.server.network.ServerPlayNetworkHandler;
 import net.minecraft.server.network.ServerPlayerEntity;
 import io.netty.channel.Channel;
@@ -69,6 +71,9 @@ public class PvpReplayFabric implements ModInitializer {
         log.info("PvpReplay 已加载。模式=" + config.getMode() + " 视角=" + config.getPerspective()
                 + " 上限=" + config.getMaxDiskGb() + "GB/" + config.getMaxDays() + "天");
 
+        // C0: inject the capture handler as early as login success, so the Login /
+        // Respawn / initial-chunk packets are buffered before the play session starts.
+        ServerLoginConnectionEvents.LOGIN_SUCCESS.register((loginHandler, server) -> onLogin(loginHandler));
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> onJoin(handler));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> onLeave(handler));
         ServerTickEvents.END_SERVER_TICK.register(server -> pollDimensions(server));
@@ -83,28 +88,50 @@ public class PvpReplayFabric implements ModInitializer {
         }, 60, 60, TimeUnit.SECONDS);
     }
 
+    // C0: inject the capture handler at login success (same channel as the play
+    // phase). The handler buffers outbound packets until onJoin() calls beginSession.
+    // The channel is fetched reflectively (loginHandler.connection -> channel()).
+    private void onLogin(ServerLoginPacketListenerImpl loginHandler) {
+        if (!mgr.isRecording()) return;
+        Object conn = tryField(loginHandler, "connection"); // ClientConnection (Yarn)
+        if (conn == null) conn = tryInvoke(loginHandler, "getConnection");
+        Channel channel = null;
+        if (conn != null) {
+            Object ch = tryInvoke(conn, "channel");
+            if (ch instanceof Channel) channel = (Channel) ch;
+        }
+        if (channel == null) return;
+        PacketCapture.inject(channel, mgr, log);
+    }
+
     private void onJoin(ServerPlayNetworkHandler handler) {
         Object player = playerOf(handler);
         if (player == null || !mgr.isRecording()) return;
+        Channel ch = channelOf(handler);
         String dim = dimKey(player);
-        if (!shouldRecord(dim)) return;
+        if (!shouldRecord(dim)) {
+            PacketCapture.discard(ch); // DUEL 非目标维度：丢弃 login 缓冲，不录制
+            return;
+        }
 
         ReplayMeta meta = buildMeta(player);
         final String key;
         if (config.getPerspective() == ReplayConfig.Perspective.EACH) {
             key = "p_" + playerUuid(player);
-            mgr.startSession(key, meta);
         } else {
             String cameraUuid = playerUuid(player);
             key = "dim_" + sanitize(dim);
             if (cameraKeyByUuid.putIfAbsent(cameraUuid, key) != null) {
-                return; // 该维度已有镜头（或本玩家已是镜头）-> 非镜头：不注入、不结束
+                PacketCapture.discard(ch); // 非镜头 SHARED：停止缓冲、不录制
+                return;
             }
-            mgr.startSession(key, meta);
         }
 
-        Channel ch = channelOf(handler);
-        PacketCapture.inject(ch, key, mgr, log);
+        // Anchor the session timeline to the connection moment (captured at login),
+        // then flush the buffered login-phase packets and switch to live capture.
+        long t0 = PacketCapture.getConnectionStartNanos(ch);
+        mgr.startSession(key, meta, t0 >= 0 ? t0 : System.nanoTime());
+        PacketCapture.beginSession(ch, key, mgr, log);
     }
 
     private void onLeave(ServerPlayNetworkHandler handler) {
@@ -118,7 +145,11 @@ public class PvpReplayFabric implements ModInitializer {
             mgr.endSession(key);
         } else {
             String key = cameraKeyByUuid.remove(cameraUuid);
-            if (key == null) return; // 非镜头离开 -> 什么都不做
+            if (key == null) {
+                // C0: 非镜头 SHARED 玩家也在 login 阶段注入了缓冲，离开时清理以免泄漏
+                PacketCapture.remove(channelOf(handler));
+                return;
+            }
             PacketCapture.remove(channelOf(handler));
             mgr.endSession(key);
         }
@@ -151,8 +182,13 @@ public class PvpReplayFabric implements ModInitializer {
         ReplayMeta meta = buildMeta(player);
         String newKey = each ? "p_" + uuid : "dim_" + sanitize(newDim);
         if (!each) cameraKeyByUuid.put(uuid, newKey);
-        mgr.startSession(newKey, meta);
-        PacketCapture.inject(channelOfPlayer(player), newKey, mgr, log);
+        // 维度切换产生独立的 .mcpr，时间轴从切换时刻起算（而非连接时刻）。
+        long t0 = System.nanoTime();
+        mgr.startSession(newKey, meta, t0);
+        if (ch != null) {
+            PacketCapture.inject(ch, mgr, log);
+            PacketCapture.beginSession(ch, newKey, mgr, log);
+        }
     }
 
     // Fabric (Yarn) exposes the online players via MinecraftServer#getPlayerManager().getPlayerList();

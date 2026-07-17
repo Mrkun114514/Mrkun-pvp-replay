@@ -37,6 +37,21 @@ public class ReplayManager {
 
     /** @return true if a session was newly created. */
     public boolean startSession(String key, ReplayMeta meta) {
+        return startSession(key, meta, System.nanoTime());
+    }
+
+    /**
+     * Begin a session anchored to {@code startNanos} (the connection moment, t=0).
+     *
+     * <p>Passing the connection moment instead of {@link System#nanoTime()} lets the
+     * login-phase buffer (captured before the session existed) line up on the same
+     * timeline once {@link com.pvpreplay.capture.PacketCapture#beginSession} flushes
+     * it. For sessions created later (e.g. a dimension change) callers pass a fresh
+     * {@code System.nanoTime()} so the new {@code .mcpr} starts at its own t=0.
+     *
+     * @return true if a session was newly created.
+     */
+    public boolean startSession(String key, ReplayMeta meta, long startNanos) {
         if (!isRecording()) return false;
         Session s = active.get(key);
         if (s != null) return false;
@@ -44,7 +59,6 @@ public class ReplayManager {
             ReplayWriter w = new ReplayWriter(outDir, key, meta);
             w.start();
             long startWall = System.currentTimeMillis();
-            long startNanos = System.nanoTime();
             active.put(key, new Session(w, meta, startWall, startNanos));
             log.info("开始回放会话: " + key);
             return true;
@@ -69,6 +83,25 @@ public class ReplayManager {
                     endSession(key);
                 }
             }
+        } catch (IOException e) {
+            log.error("写入回放包失败 " + key, e);
+        }
+    }
+
+    /**
+     * Write a packet with an explicit timestamp. Used to flush the login-phase
+     * buffer (captured before the session existed) so its original relative timing
+     * is preserved — {@link #writePacket} would otherwise recompute the timestamp
+     * from the current clock and collapse the whole buffer onto one instant,
+     * destroying the Login / Respawn ordering that C0 exists to capture.
+     * Skips the duration-limit check on purpose (flush happens at session start,
+     * where elapsed time is ~0 and ending the session mid-flush would lose packets).
+     */
+    public void writePacketAt(String key, long tsMs, byte[] encoded) {
+        Session s = active.get(key);
+        if (s == null) return;
+        try {
+            s.writer.writePacket(tsMs, encoded);
         } catch (IOException e) {
             log.error("写入回放包失败 " + key, e);
         }
