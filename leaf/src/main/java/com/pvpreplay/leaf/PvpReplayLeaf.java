@@ -11,6 +11,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -20,13 +21,15 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.function.LongSupplier;
 
 public class PvpReplayLeaf extends JavaPlugin implements Listener {
 
     private ReplayConfig config;
     private ReplayManager mgr;
     private ReplayLogger log;
+
+    // Camera player UUID -> active SHARED session key (C2); updated on world change (M3).
+    private final java.util.Map<String,String> cameraKeyByUuid = new java.util.concurrent.ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
@@ -79,29 +82,59 @@ public class PvpReplayLeaf extends JavaPlugin implements Listener {
         ReplayMeta meta = buildMeta(player);
         final String key;
         if (config.getPerspective() == ReplayConfig.Perspective.EACH) {
-            key = "p_" + player.getUniqueId();
+            key = "p_" + player.getUniqueId().toString();
             mgr.startSession(key, meta);
         } else {
+            String cameraUuid = player.getUniqueId().toString();
             key = "dim_" + sanitize(dim);
-            if (mgr.hasSession(key)) return;
+            if (cameraKeyByUuid.putIfAbsent(cameraUuid, key) != null) {
+                return; // 该维度已有镜头（或本玩家已是镜头）-> 非镜头：不注入、不结束
+            }
             mgr.startSession(key, meta);
         }
 
         Channel ch = channelOf(player);
-        long injectNanos = System.nanoTime();
-        LongSupplier clock = () -> (System.nanoTime() - injectNanos) / 1_000_000L;
-        PacketCapture.inject(ch, key, mgr, log, clock);
+        PacketCapture.inject(ch, key, mgr, log);
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
         Player player = e.getPlayer();
-        String dim = dimKey(player);
-        final String key = (config.getPerspective() == ReplayConfig.Perspective.EACH)
-                ? "p_" + player.getUniqueId()
-                : "dim_" + sanitize(dim);
+        String cameraUuid = player.getUniqueId().toString();
+        if (config.getPerspective() == ReplayConfig.Perspective.EACH) {
+            String key = "p_" + cameraUuid;
+            PacketCapture.remove(channelOf(player));
+            mgr.endSession(key);
+        } else {
+            String key = cameraKeyByUuid.remove(cameraUuid);
+            if (key == null) return; // 非镜头离开 -> 什么都不做
+            PacketCapture.remove(channelOf(player));
+            mgr.endSession(key);
+        }
+    }
+
+    @EventHandler
+    public void onChangedWorld(PlayerChangedWorldEvent e) {
+        Player player = e.getPlayer();
+        String newDim = dimKey(player); // player.getWorld() is the NEW world after the change
+        handleDimensionChange(player, newDim);
+    }
+
+    private void handleDimensionChange(Player player, String newDim) {
+        if (!mgr.isRecording()) return;
+        String uuid = player.getUniqueId().toString();
+        boolean each = config.getPerspective() == ReplayConfig.Perspective.EACH;
+        String oldKey = each ? "p_" + uuid : cameraKeyByUuid.get(uuid);
+        if (oldKey == null) return; // SHARED：非镜头玩家
         PacketCapture.remove(channelOf(player));
-        mgr.endSession(key);
+        mgr.endSession(oldKey);
+        if (!each) cameraKeyByUuid.remove(uuid);
+        if (!shouldRecord(newDim)) return;
+        ReplayMeta meta = buildMeta(player);
+        String newKey = each ? "p_" + uuid : "dim_" + sanitize(newDim);
+        if (!each) cameraKeyByUuid.put(uuid, newKey);
+        mgr.startSession(newKey, meta);
+        PacketCapture.inject(channelOf(player), newKey, mgr, log);
     }
 
     private boolean shouldRecord(String dim) {

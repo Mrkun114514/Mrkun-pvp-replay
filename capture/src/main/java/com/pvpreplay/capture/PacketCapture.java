@@ -12,7 +12,6 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 
 import java.lang.reflect.Method;
-import java.util.function.LongSupplier;
 
 /**
  * Unified, loader-agnostic packet capture.
@@ -46,10 +45,8 @@ public final class PacketCapture {
      * @param key      session key (player uuid, or dimension key for SHARED)
      * @param mgr      the replay manager
      * @param log      logger
-     * @param clock    returns milliseconds since the session started
      */
-    public static void inject(Channel channel, String key, ReplayManager mgr,
-                              ReplayLogger log, LongSupplier clock) {
+    public static void inject(Channel channel, String key, ReplayManager mgr, ReplayLogger log) {
         if (channel == null || !channel.isActive()) return;
         ChannelPipeline pipe = channel.pipeline();
         if (pipe.get(HANDLER_NAME) != null) return;          // already injected
@@ -61,7 +58,7 @@ public final class PacketCapture {
         try {
             Method encodeMethod = findEncode(encoder);
             pipe.addBefore("encoder", HANDLER_NAME,
-                    new CaptureHandler(key, mgr, log, clock, encoder, encodeMethod));
+                    new CaptureHandler(key, mgr, log, encoder, encodeMethod));
         } catch (Exception e) {
             log.error("注入抓包处理器失败: " + key, e);
         }
@@ -88,16 +85,14 @@ public final class PacketCapture {
         private final String key;
         private final ReplayManager mgr;
         private final ReplayLogger log;
-        private final LongSupplier clock;
         private final ChannelHandler encoder;
         private final Method encodeMethod;
 
         CaptureHandler(String key, ReplayManager mgr, ReplayLogger log,
-                       LongSupplier clock, ChannelHandler encoder, Method encodeMethod) {
+                       ChannelHandler encoder, Method encodeMethod) {
             this.key = key;
             this.mgr = mgr;
             this.log = log;
-            this.clock = clock;
             this.encoder = encoder;
             this.encodeMethod = encodeMethod;
         }
@@ -108,7 +103,7 @@ public final class PacketCapture {
                 try {
                     byte[] encoded = encodePacket(ctx, encoder, encodeMethod, msg);
                     if (encoded != null && encoded.length > 0) {
-                        mgr.writePacket(key, clock.getAsLong(), encoded);
+                        mgr.writePacket(key, encoded);
                     }
                 } catch (Exception ignored) {
                     // msg was not a Packet (or encode failed) — just forward it.

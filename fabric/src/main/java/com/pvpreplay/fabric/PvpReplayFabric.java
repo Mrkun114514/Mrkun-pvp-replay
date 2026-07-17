@@ -8,9 +8,12 @@ import com.pvpreplay.core.ReplayManager;
 import com.pvpreplay.core.ReplayMeta;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayNetworkHandler;
+import net.minecraft.server.network.ServerPlayerEntity;
 import io.netty.channel.Channel;
 
 import java.io.IOException;
@@ -21,7 +24,6 @@ import java.nio.file.Path;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.function.LongSupplier;
 
 public class PvpReplayFabric implements ModInitializer {
 
@@ -33,6 +35,11 @@ public class PvpReplayFabric implements ModInitializer {
         t.setDaemon(true);
         return t;
     });
+
+    // Camera player UUID -> active SHARED session key (C2) and the per-tick dimension
+    // poll map (M3). Fully-qualified types keep this module free of extra imports.
+    private final java.util.Map<String,String> cameraKeyByUuid = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Map<String,String> lastDimByUuid = new java.util.concurrent.ConcurrentHashMap<>();
 
     @Override
     public void onInitialize() {
@@ -64,6 +71,7 @@ public class PvpReplayFabric implements ModInitializer {
 
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> onJoin(handler));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> onLeave(handler));
+        ServerTickEvents.END_SERVER_TICK.register(server -> pollDimensions(server));
 
         ServerLifecycleEvents.SERVER_STARTED.register(server -> startSweeper());
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> mgr.closeAll());
@@ -87,28 +95,64 @@ public class PvpReplayFabric implements ModInitializer {
             key = "p_" + playerUuid(player);
             mgr.startSession(key, meta);
         } else {
+            String cameraUuid = playerUuid(player);
             key = "dim_" + sanitize(dim);
-            if (mgr.hasSession(key)) {
-                return; // 该维度已有镜头，无需重复
+            if (cameraKeyByUuid.putIfAbsent(cameraUuid, key) != null) {
+                return; // 该维度已有镜头（或本玩家已是镜头）-> 非镜头：不注入、不结束
             }
             mgr.startSession(key, meta);
         }
 
         Channel ch = channelOf(handler);
-        long injectNanos = System.nanoTime();
-        LongSupplier clock = () -> (System.nanoTime() - injectNanos) / 1_000_000L;
-        PacketCapture.inject(ch, key, mgr, log, clock);
+        PacketCapture.inject(ch, key, mgr, log);
     }
 
     private void onLeave(ServerPlayNetworkHandler handler) {
         Object player = playerOf(handler);
         if (player == null) return;
-        String dim = dimKey(player);
-        final String key = (config.getPerspective() == ReplayConfig.Perspective.EACH)
-                ? "p_" + playerUuid(player)
-                : "dim_" + sanitize(dim);
-        PacketCapture.remove(channelOf(handler));
-        mgr.endSession(key);
+        String cameraUuid = playerUuid(player);
+        lastDimByUuid.remove(cameraUuid);
+        if (config.getPerspective() == ReplayConfig.Perspective.EACH) {
+            String key = "p_" + cameraUuid;
+            PacketCapture.remove(channelOf(handler));
+            mgr.endSession(key);
+        } else {
+            String key = cameraKeyByUuid.remove(cameraUuid);
+            if (key == null) return; // 非镜头离开 -> 什么都不做
+            PacketCapture.remove(channelOf(handler));
+            mgr.endSession(key);
+        }
+    }
+
+    // Fabric has no dimension-change event, so poll each server tick and react when a
+    // player's current world differs from the last observed one (M3).
+    private void pollDimensions(MinecraftServer server) {
+        if (!mgr.isRecording()) return;
+        for (ServerPlayerEntity player : server.getPlayerList().getPlayers()) {
+            String uuid = playerUuid(player);
+            if (uuid.isEmpty()) continue;
+            String curDim = dimKey(player);
+            String prev = lastDimByUuid.put(uuid, curDim);
+            if (prev == null || prev.equals(curDim)) continue;
+            handleDimensionChange(player, curDim);
+        }
+    }
+
+    private void handleDimensionChange(ServerPlayerEntity player, String newDim) {
+        String uuid = playerUuid(player);
+        boolean each = config.getPerspective() == ReplayConfig.Perspective.EACH;
+        String oldKey = each ? "p_" + uuid : cameraKeyByUuid.get(uuid);
+        if (oldKey == null) return; // SHARED：非镜头玩家，无需处理
+        Channel ch = channelOfPlayer(player);
+        if (ch != null) PacketCapture.remove(ch);
+        mgr.endSession(oldKey);
+        if (!each) cameraKeyByUuid.remove(uuid);
+        if (!shouldRecord(newDim)) return;
+        ReplayMeta meta = buildMeta(player);
+        String newKey = each ? "p_" + uuid : "dim_" + sanitize(newDim);
+        if (!each) cameraKeyByUuid.put(uuid, newKey);
+        mgr.startSession(newKey, meta);
+        PacketCapture.inject(channelOfPlayer(player), newKey, mgr, log);
     }
 
     private boolean shouldRecord(String dim) {
@@ -134,61 +178,73 @@ public class PvpReplayFabric implements ModInitializer {
     // Using reflection on Object keeps this module compatible with either.
 
     private static Object playerOf(ServerPlayNetworkHandler h) {
-        try { return field(h, "player"); }
+        try { return tryField(h, "player"); }
         catch (Exception e) { return null; }
     }
 
-    private static Channel channelOf(ServerPlayNetworkHandler h) {
+    private static Channel channelOf(Object h) {
         try {
-            Object conn = invoke(h, "getConnection");
-            if (conn == null) conn = field(h, "connection");
+            Object conn = tryInvoke(h, "getConnection");
+            if (conn == null) conn = tryField(h, "connection");
             if (conn == null) return null;
-            Object ch = invoke(conn, "channel");
+            Object ch = tryInvoke(conn, "channel");
             return (Channel) ch;
         } catch (Exception e) { return null; }
     }
 
+    private static Channel channelOfPlayer(Object player) {
+        Object handler = tryInvoke(player, "networkHandler"); // Yarn: ServerPlayerEntity#getNetworkHandler
+        if (handler == null) handler = tryInvoke(player, "connection"); // Mojang
+        return handler != null ? channelOf(handler) : null;
+    }
+
     private static String dimKey(Object player) {
         try {
-            Object level = invoke(player, "level");
-            if (level == null) level = invoke(player, "getWorld");
-            if (level == null) level = field(player, "level");
-            Object dim = invoke(level, "dimension");
-            Object loc = invoke(dim, "location");        // Mojang ResourceKey#location
-            if (loc == null) loc = invoke(dim, "getValue"); // Yarn ResourceKey#getValue
-            if (loc == null) loc = field(dim, "location");
+            Object level = tryInvoke(player, "getWorld");        // Yarn
+            if (level == null) level = tryInvoke(player, "level"); // Mojang
+            if (level == null) level = tryField(player, "world");
+            if (level == null) return "minecraft:overworld";
+            Object dim = tryInvoke(level, "getDimensionKey");    // Yarn
+            if (dim == null) dim = tryInvoke(level, "dimension"); // Mojang
+            if (dim == null) return "minecraft:overworld";
+            Object loc = tryInvoke(dim, "getValue");            // Yarn ResourceKey#getValue
+            if (loc == null) loc = tryInvoke(dim, "location"); // Mojang ResourceKey#location
+            if (loc == null) loc = tryField(dim, "location");
             return loc != null ? loc.toString() : "minecraft:overworld";
         } catch (Exception e) { return "minecraft:overworld"; }
     }
 
     private static String playerName(Object p) {
-        try { Object comp = invoke(p, "getName"); return String.valueOf(invoke(comp, "getString")); }
-        catch (Exception e) { return "player"; }
+        try {
+            Object comp = tryInvoke(p, "getName");
+            if (comp == null) return "player";
+            Object s = tryInvoke(comp, "getString");
+            return s != null ? String.valueOf(s) : "player";
+        } catch (Exception e) { return "player"; }
     }
 
     private static String playerUuid(Object p) {
         try {
-            Object u = invoke(p, "getUUID");       // Mojang
-            if (u == null) u = invoke(p, "getUuid"); // Yarn
+            Object u = tryInvoke(p, "getUUID");       // Mojang
+            if (u == null) u = tryInvoke(p, "getUuid"); // Yarn
             return u != null ? u.toString() : "";
         } catch (Exception e) { return ""; }
     }
 
     private static int playerId(Object p) {
-        try { return (int) invoke(p, "getId"); } catch (Exception e) { return -1; }
+        try { return (int) tryInvoke(p, "getId"); } catch (Exception e) { return -1; }
     }
 
-    private static Object invoke(Object o, String name) throws Exception {
+    private static Object tryInvoke(Object o, String name) {
         if (o == null) return null;
-        Method m = o.getClass().getMethod(name);
-        m.setAccessible(true);
-        return m.invoke(o);
+        try { Method m = o.getClass().getMethod(name); m.setAccessible(true); return m.invoke(o); }
+        catch (Exception e) { return null; }
     }
 
-    private static Object field(Object o, String name) throws Exception {
-        Field f = o.getClass().getDeclaredField(name);
-        f.setAccessible(true);
-        return f.get(o);
+    private static Object tryField(Object o, String name) {
+        if (o == null) return null;
+        try { Field f = o.getClass().getDeclaredField(name); f.setAccessible(true); return f.get(o); }
+        catch (Exception e) { return null; }
     }
 
     private static String sanitize(String s) { return s == null ? "unknown" : s.replace(':', '_'); }

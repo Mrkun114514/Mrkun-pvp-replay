@@ -24,7 +24,6 @@ import java.nio.file.Path;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.function.LongSupplier;
 
 @Mod(PvpReplayNeoForge.MODID)
 public class PvpReplayNeoForge {
@@ -38,6 +37,9 @@ public class PvpReplayNeoForge {
         t.setDaemon(true);
         return t;
     });
+
+    // Camera player UUID -> active SHARED session key (C2); updated on dimension change (M3).
+    private final java.util.Map<String,String> cameraKeyByUuid = new java.util.concurrent.ConcurrentHashMap<>();
 
     public PvpReplayNeoForge() {
         Path configDir = FMLPaths.CONFIGDIR.get().resolve("pvp-replay");
@@ -78,29 +80,59 @@ public class PvpReplayNeoForge {
         ReplayMeta meta = buildMeta(player);
         final String key;
         if (config.getPerspective() == ReplayConfig.Perspective.EACH) {
-            key = "p_" + player.getUUID();
+            key = "p_" + player.getUUID().toString();
             mgr.startSession(key, meta);
         } else {
+            String cameraUuid = player.getUUID().toString();
             key = "dim_" + sanitize(dim);
-            if (mgr.hasSession(key)) return;
+            if (cameraKeyByUuid.putIfAbsent(cameraUuid, key) != null) {
+                return; // 该维度已有镜头（或本玩家已是镜头）-> 非镜头：不注入、不结束
+            }
             mgr.startSession(key, meta);
         }
 
         Channel ch = channelOf(player);
-        long injectNanos = System.nanoTime();
-        LongSupplier clock = () -> (System.nanoTime() - injectNanos) / 1_000_000L;
-        PacketCapture.inject(ch, key, mgr, log, clock);
+        PacketCapture.inject(ch, key, mgr, log);
     }
 
     @SubscribeEvent
     public void onLeave(PlayerEvent.PlayerLoggedOutEvent e) {
         if (!(e.getEntity() instanceof ServerPlayer player)) return;
-        String dim = dimKey(player);
-        final String key = (config.getPerspective() == ReplayConfig.Perspective.EACH)
-                ? "p_" + player.getUUID()
-                : "dim_" + sanitize(dim);
+        String cameraUuid = player.getUUID().toString();
+        if (config.getPerspective() == ReplayConfig.Perspective.EACH) {
+            String key = "p_" + cameraUuid;
+            PacketCapture.remove(channelOf(player));
+            mgr.endSession(key);
+        } else {
+            String key = cameraKeyByUuid.remove(cameraUuid);
+            if (key == null) return; // 非镜头离开 -> 什么都不做
+            PacketCapture.remove(channelOf(player));
+            mgr.endSession(key);
+        }
+    }
+
+    @SubscribeEvent
+    public void onChangedDimension(PlayerEvent.PlayerChangedDimensionEvent e) {
+        if (!(e.getEntity() instanceof ServerPlayer player)) return;
+        String newDim = e.getTo().location().toString();
+        handleDimensionChange(player, newDim);
+    }
+
+    private void handleDimensionChange(ServerPlayer player, String newDim) {
+        if (!mgr.isRecording()) return;
+        String uuid = player.getUUID().toString();
+        boolean each = config.getPerspective() == ReplayConfig.Perspective.EACH;
+        String oldKey = each ? "p_" + uuid : cameraKeyByUuid.get(uuid);
+        if (oldKey == null) return; // SHARED：非镜头玩家
         PacketCapture.remove(channelOf(player));
-        mgr.endSession(key);
+        mgr.endSession(oldKey);
+        if (!each) cameraKeyByUuid.remove(uuid);
+        if (!shouldRecord(newDim)) return;
+        ReplayMeta meta = buildMeta(player);
+        String newKey = each ? "p_" + uuid : "dim_" + sanitize(newDim);
+        if (!each) cameraKeyByUuid.put(uuid, newKey);
+        mgr.startSession(newKey, meta);
+        PacketCapture.inject(channelOf(player), newKey, mgr, log);
     }
 
     @SubscribeEvent

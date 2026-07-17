@@ -56,11 +56,12 @@ public class ReplayManager {
 
     public boolean hasSession(String key) { return active.containsKey(key); }
 
-    public void writePacket(String key, long absTsMs, byte[] encoded) {
+    public void writePacket(String key, byte[] encoded) {
         Session s = active.get(key);
         if (s == null) return;
         try {
-            s.writer.writePacket(absTsMs, encoded);
+            long tsMs = (System.nanoTime() - s.startNanos) / 1_000_000L;
+            s.writer.writePacket(tsMs, encoded);
             if (config.getMaxDurationMin() > 0) {
                 long elapsedMin = (System.nanoTime() - s.startNanos) / 60_000_000_000L;
                 if (elapsedMin >= config.getMaxDurationMin()) {

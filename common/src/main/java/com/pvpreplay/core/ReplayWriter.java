@@ -15,11 +15,11 @@ import java.util.zip.ZipOutputStream;
  * memory: packet bytes are written straight to a temp file, and only a single
  * small buffer lives in the heap. The final zip is assembled on close.
  *
- * <p>Frame layout inside {@code recording.tmcpr} (MCReplay format):
+ * <p>Frame layout inside {@code recording.tmcpr} (ReplayMod format):
  * <pre>
- *   [VarInt timestampDelta][raw encoded packet: VarInt packetId + payload]...
+ *   [int32 BE timestampMs][int32 BE length][raw encoded packet: VarInt packetId + payload]...
  * </pre>
- * The first frame's delta is treated by ReplayMod as the absolute start time.
+ * Each timestamp is cumulative milliseconds since the session started.
  */
 public class ReplayWriter implements AutoCloseable {
 
@@ -50,18 +50,26 @@ public class ReplayWriter implements AutoCloseable {
     }
 
     /**
-     * @param absTs   absolute timestamp in milliseconds since the session started
+     * @param tsMs    cumulative timestamp in milliseconds since the session started
      * @param encoded full encoded clientbound packet (VarInt packetId + payload)
      */
-    public void writePacket(long absTs, byte[] encoded) throws IOException {
+    public void writePacket(long tsMs, byte[] encoded) throws IOException {
         if (!started || closed || encoded == null || encoded.length == 0) return;
-        long delta = (lastTs < 0) ? Math.max(0, absTs) : Math.max(0, absTs - lastTs);
-        if (lastTs < 0) firstAbs = absTs;
-        lastAbs = absTs;
-        writeVarInt(out, (int) delta);
+        if (lastTs < 0) firstAbs = tsMs;
+        lastAbs = tsMs;
+        writeIntBE(out, (int) tsMs);      // 4-byte big-endian cumulative ms timestamp
+        writeIntBE(out, encoded.length); // 4-byte big-endian length prefix
         out.write(encoded, 0, encoded.length);
-        lastTs = absTs;
+        lastTs = tsMs;
         frames++;
+    }
+
+    /** Write a 4-byte big-endian integer (matches ReplayStudio util/Utils.writeInt). */
+    private static void writeIntBE(OutputStream out, int v) throws IOException {
+        out.write((v >>> 24) & 0xFF);
+        out.write((v >>> 16) & 0xFF);
+        out.write((v >>>  8) & 0xFF);
+        out.write( v        & 0xFF);
     }
 
     public long getFrameCount() { return frames; }
@@ -73,6 +81,10 @@ public class ReplayWriter implements AutoCloseable {
         if (out != null) {
             try { out.flush(); } finally { out.close(); }
         }
+        if (frames == 0) {                       // nothing was captured
+            if (tmpFile != null) Files.deleteIfExists(tmpFile);
+            return;                             // do not produce an empty .mcpr
+        }
         long duration = Math.max(0, lastAbs - firstAbs);
         meta.setDuration(duration);
         buildZip();
@@ -82,7 +94,7 @@ public class ReplayWriter implements AutoCloseable {
     private void buildZip() throws IOException {
         Path zip = uniqueName(outDir, sessionId + ".mcpr");
         try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zip))) {
-            ZipEntry metaEntry = new ZipEntry("meta_data.json");
+            ZipEntry metaEntry = new ZipEntry("metaData.json");
             zos.putNextEntry(metaEntry);
             zos.write(metaJson().getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
@@ -116,8 +128,9 @@ public class ReplayWriter implements AutoCloseable {
     private String metaJson() {
         StringBuilder sb = new StringBuilder();
         sb.append('{');
-        sb.append("\"fileFormat\":\"MCRF\",");
-        sb.append("\"fileFormatVersion\":1,");
+        sb.append("\"fileFormat\":\"MCPR\",");
+        sb.append("\"fileFormatVersion\":14,");
+        sb.append("\"singleplayer\":false,");
         sb.append("\"generator\":").append(quote(meta.getGenerator())).append(',');
         sb.append("\"protocol\":").append(meta.getProtocol()).append(',');
         sb.append("\"mcversion\":").append(quote(meta.getMcVersion())).append(',');
@@ -126,9 +139,8 @@ public class ReplayWriter implements AutoCloseable {
         sb.append("\"duration\":").append(meta.getDuration()).append(',');
         sb.append("\"players\":[");
         for (int i = 0; i < meta.getPlayers().size(); i++) {
-            ReplayMeta.PlayerInfo pi = meta.getPlayers().get(i);
             if (i > 0) sb.append(',');
-            sb.append("{\"name\":").append(quote(pi.name)).append(",\"uuid\":").append(quote(pi.uuid)).append('}');
+            sb.append(quote(meta.getPlayers().get(i).uuid));
         }
         sb.append("],");
         sb.append("\"selfId\":").append(meta.getSelfId());
