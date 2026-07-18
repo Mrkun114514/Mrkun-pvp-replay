@@ -12,4 +12,14 @@ dependencies {
     // MC 1.20–1.21 使用 Netty 4.1.x，版本号不影响 API 兼容性。
     compileOnly 'io.netty:netty-transport:4.1.97.Final'
     compileOnly 'io.netty:netty-buffer:4.1.97.Final'
+
+    // 测试需要完整的 Netty（EmbeddedChannel 在 netty-transport，MessageToByteEncoder
+    // 在 netty-codec）以及 JUnit 5。
+    testImplementation 'io.netty:netty-all:4.1.97.Final'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
+}
+
+test {
+    useJUnitPlatform()
 }
