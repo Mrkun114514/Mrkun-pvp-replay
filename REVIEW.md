@@ -20,7 +20,7 @@
    - SHARED 模式下，*任意*玩家离开都会结束整维度的回放（而不只是镜头玩家）。
    - 在 Fabric（Yarn 映射）上，维度键永远返回 `minecraft:overworld`，导致非主世界的 DUEL 模式永远不录制，ARENA+SHARED 则把所有维度合并成一个回放。
 
-**上线前必须修复：** C1（全部 5 个子缺陷）、C2、C3。然后**验证 C0**（修完格式的文件是否真的*能播放*，还是缺了 login/play 阶段包？）。之后是 I1（并发）和 I2（空文件）。次要/加固项可随后处理。
+**上线前必须修复：** C1（全部 5 个子缺陷）、C2、C3。**C0 已实施（注入提前到 login 阶段 + 缓冲刷盘保留原始时间戳）+ L1 单元测试 CI 验证通过**，但 L2 真机 ReplayMod 播放实测（尤其 NeoForge 部分修复）仍待用户侧确认。I1（并发）已由 C2 的 `putIfAbsent` 一并解决，I2（空文件）已修复。次要/加固项可随后处理。
 
 严重级别图例：**Critical（致命）**（文件打不开 / 数据损坏）· **Important（重要）**（数据竞争 / 产出浪费）· **Minor（次要）**（死配置 / 范围漂移）· **Hardening（加固）**（健壮性、性能、可维护性）。
 
@@ -123,20 +123,28 @@ sb.append("\"singleplayer\":false,");
 
 ---
 
-### C0. 在 JOIN 才注入捕获 → 缺失 login / play 阶段包（需验证 —— 很可能播放所必需）[新增，主理人补充]
+### C0. 在 JOIN 才注入捕获 → 缺失 login / play 阶段包 [已确认 + 实施 + L1 单测 + CI 验证]
 
-**风险：** `PacketCapture.inject` 在三个加载器里都是从 **JOIN** 事件调用的（Fabric `ServerPlayConnectionEvents.JOIN` 第 65 行、NeoForge `PlayerLoggedInEvent` 第 73 行、Leaf `PlayerJoinEvent` 第 73 行）。到那时玩家的连接已经完全进入 PLAY 状态，因此**客户端方向的 Login(play) 包**（维度注册表 + 出生点）以及配置阶段的包在注入之前就已经发出、**从未被捕获**。
+**原始风险（已确认）：** `PacketCapture.inject` 在三个加载器里原本都是从 **JOIN** 事件调用的。到那时玩家的连接已经完全进入 PLAY 状态，因此**客户端方向的 Login(play) 包**（维度注册表 + 出生点）以及配置阶段的包在注入之前就已经发出、**从未被捕获**。ReplayMod 的回放播放器需要那个首个 Login(play) / Respawn 包来初始化 `ClientWorld` 并安置镜头——这就是"修完 C1 格式仍可能播不出来 / 镜头丢失"的剩余根因。
 
-ReplayMod 的回放播放器需要那个首个 Login(play) / Respawn 包来初始化 `ClientWorld` 并安置镜头。一份格式正确（修完 C1 后）却从 PLAY 中途开始、没有世界初始化包的回放，最可能是"修完格式仍然播不出来 / 镜头丢失"的剩余原因。
+**修复 —— 把注入时机提前到 login 阶段（缓冲 + 刷盘模式）：**
+- 注入点提前到连接进 LOGIN 状态：`PacketCapture.inject` 现在从 login 事件调用——
+  - Fabric：`ServerLoginConnectionEvents.INIT`（连接进入 LOGIN 状态即触发，比 JOIN 更早；Fabric API 0.102 只有 `INIT`/`QUERY_START`/`DISCONNECT`，**没有** `LOGIN_SUCCESS`）
+  - Leaf：`PlayerLoginEvent`（Paper API）
+  - NeoForge：`PlayerLoggedInEvent`（见下方限制——NeoForge 无更早的 login 事件）
+- 注入后进入**缓冲态**：login/配置阶段的包被写入 `ConcurrentLinkedQueue<Buf>`，每个 `Buf` 带着**捕获时刻的原始 `tsMs`**（netty 事件循环线程写入，由 `synchronized` 守卫）。
+- 到 **JOIN** 时调用 `PacketCapture.beginSession(key, mgr)`，由服务端主线程把缓冲队列刷入会话——关键是每个包用 `ReplayManager.writePacketAt(key, b.tsMs, b.data)` 以**原始捕获时间戳**落盘，而不是 `writePacket`（后者会按"当前时钟 − 会话起点"重算，把缓冲包全部折叠到刷盘瞬间，丢失 Login/Respawn 时序）。
+- 异常连接：`discard()` 清空缓冲并置 `discarded`，之后无论 `beginSession` 还是 `write` 都不再产出任何包 → 不会产生回放文件（与 I2 的"零帧不落盘"配合）。
 
-**这一点尚未被证实为硬性 bug** —— 给定元数据里的 `protocol` + `fileFormatVersion`，ReplayMod *可能* 能容忍纯 PLAY 流，但这取决于版本，必须实测确认。
+**验证（L1 纯单元测试 + CI，无需服务端）：** 新增 `capture/src/test/java/com/pvpreplay/capture/PacketCaptureC0Test.java`（JUnit5 + Netty `EmbeddedChannel`，零 MC 依赖），已提交 `72b60e1` 并推送。CI run `29625287872`（`Build with Gradle (all modules)` = success）触发 `:capture:test`，**2 个用例全部通过**：
+1. `c0_loginPhaseBufferKeepsCaptureTimeTimestamps` —— login 阶段写 3 个包（中间各 sleep 50ms），JOIN 刷盘后解析 `.mcpr`，断言 3 帧时间戳**严格递增且跨度 > 50ms**。直接证明 `writePacketAt` 保留了各包原始采集时间戳、未被折叠到刷盘瞬间。
+2. `c0_discardDropsBufferedPackets` —— 缓冲阶段 `discard()` 后不产生回放文件（0 帧），证明异常连接不污染磁盘。
 
-**验证方法：** 应用 C1 后，录一段约 10 秒的回放，用**同版本**的 ReplayMod 客户端打开。如果世界/镜头没有初始化，说明你缺了 login/play 阶段包。两种修复：
+> 这坐实了 C0 的**核心逻辑**（login 缓冲 / 保留原始时间戳 / discard）正确；但"回放真的能在 ReplayMod 里播放、世界渲染完整、镜头能跟随"仍需用户本机起服做 L2 真机实测（见下方 NeoForge 限制）。
 
-1. **从连接建立时就捕获（推荐，最稳健）。** 在 `ClientConnection` 被创建时（login 之前）就注入处理器，这样 login + 配置 + play 包全部被捕获 —— 正是 ReplayMod *客户端* 的做法。需要对各加载器的连接建立做钩子（`ClientConnection` / 登录监听器），更侵入但能产出完全合法的回放。
-2. **在会话开始时合成一个 Login(play) + 初始 Respawn/位置包**，取材于玩家当前世界（维度编解码器、出生点、游戏模式）。改动更收敛，但需要构建一个正确的 play-Login 包（维度注册表）—— 跨 1.20.x/1.21.x 并不简单。
+**NeoForge 限制（重要，未完全修复）：** NeoForge 21.1 **没有**早于 `PlayerLoggedInEvent` 的干净 login/连接事件，因此 C0 在 NeoForge 上只是**部分修复**——login 握手包仍可能漏掉。Fabric（Yarn）与 Leaf（Paper）路径是完整的（从 `INIT` / `PlayerLoginEvent` 起注入）。此外，即便 Fabric/Leaf，若 login 握手包在 `INIT` 事件触发**之前**就已发出，仍可能漏（极端边界）。这些边界都只能通过 L2 真机 ReplayMod 播放来确认世界渲染是否完整。
 
-> 在 C0 被验证/解决之前，要把"文件能在 ReplayMod 里打开"（修完 C1 后）和"回放真的能播放"当作**两个独立的检查**。
+> 仍要把"文件能在 ReplayMod 里打开"（C1）和"回放真的能播放"（C0 + L2 实测）当作**两个独立的检查**。
 
 ---
 
